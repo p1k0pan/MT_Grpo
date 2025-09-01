@@ -441,19 +441,71 @@ class DataParallelPPOActor(BasePPOActor):
                         old_log_prob = model_inputs["old_log_probs"]
 
                     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
-                    # vanilla -> verl.trainer.ppo.core_algos.compute_policy_loss_vanilla
-                    # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
-                    # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
-                    policy_loss_fn = get_policy_loss_fn(loss_mode)
-                    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
-                        old_log_prob=old_log_prob,
-                        log_prob=log_prob,
-                        advantages=advantages,
-                        response_mask=response_mask,
-                        loss_agg_mode=loss_agg_mode,
-                        config=self.config,
-                        rollout_log_probs=rollout_log_probs,
-                    )
+                    use_separated_loss = getattr(self.config, 'use_separated_loss', False)
+                    
+                    if use_separated_loss and "advantages_tr" in model_inputs and "advantages_th" in model_inputs:
+                        # Separated loss mode: compute losses for translate and think separately
+                        print("🔥 [LOSS_COMPUTATION] Computing separated policy losses: pg_loss_tr + pg_loss_th")
+                        from verl.trainer.ppo.core_algos import compute_policy_loss_vanilla
+                        
+                        # Get separated advantages and masks
+                        A_tr_broadcast = model_inputs["advantages_tr"]
+                        A_th_broadcast = model_inputs["advantages_th"] 
+                        mask_tr = model_inputs["response_mask_tr"]
+                        mask_th = model_inputs["response_mask_th"]
+                        
+                        # 1) Translate branch loss
+                        pg_loss_tr, pg_clipfrac_tr, ppo_kl_tr, pg_clipfrac_lower_tr = compute_policy_loss_vanilla(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=A_tr_broadcast,
+                            response_mask=mask_tr,
+                            loss_agg_mode=loss_agg_mode,
+                            config=self.config,
+                            rollout_log_probs=rollout_log_probs,
+                        )
+                        
+                        # 2) Think branch loss  
+                        pg_loss_th, pg_clipfrac_th, ppo_kl_th, pg_clipfrac_lower_th = compute_policy_loss_vanilla(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=A_th_broadcast,
+                            response_mask=mask_th,
+                            loss_agg_mode=loss_agg_mode,
+                            config=self.config,
+                            rollout_log_probs=rollout_log_probs,
+                        )
+                        
+                        # Combine losses
+                        pg_loss = pg_loss_tr + pg_loss_th
+                        pg_clipfrac = (pg_clipfrac_tr + pg_clipfrac_th) / 2  # Average clip fractions
+                        ppo_kl = (ppo_kl_tr + ppo_kl_th) / 2  # Average KL divergences
+                        pg_clipfrac_lower = (pg_clipfrac_lower_tr + pg_clipfrac_lower_th) / 2  # Average lower clip fractions
+                        
+                        # Store metrics for monitoring
+                        micro_batch_metrics["actor/pg_loss_tr"] = pg_loss_tr.detach().item() * loss_scale_factor
+                        micro_batch_metrics["actor/pg_loss_th"] = pg_loss_th.detach().item() * loss_scale_factor
+                        micro_batch_metrics["actor/pg_clipfrac_tr"] = pg_clipfrac_tr.detach().item() 
+                        micro_batch_metrics["actor/pg_clipfrac_th"] = pg_clipfrac_th.detach().item()
+                        assert (mask_tr * mask_th).sum() == 0, "masks must be disjoint"
+                        assert ((A_tr_broadcast * (1-A_th_broadcast)) == 0).all(), "A_tr must be zero outside <translate>"
+                        assert ((A_th_broadcast * (1-A_tr_broadcast)) == 0).all(), "A_th must be zero outside <think>"
+
+                    else:
+                        # Standard unified loss mode
+                        # vanilla -> verl.trainer.ppo.core_algos.compute_policy_loss_vanilla
+                        # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg  
+                        # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
+                        policy_loss_fn = get_policy_loss_fn(loss_mode)
+                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            config=self.config,
+                            rollout_log_probs=rollout_log_probs,
+                        )
 
                     if entropy_coeff != 0:
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)

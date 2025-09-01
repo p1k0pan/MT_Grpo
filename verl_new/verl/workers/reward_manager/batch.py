@@ -44,7 +44,7 @@ class BatchRewardManager(AbstractRewardManager):
         self.reward_fn_key = reward_fn_key
         self.reward_kwargs = reward_kwargs
 
-    def verify(self, data):
+    def verify(self, data, return_separated=False):
         prompt_ids = data.batch["prompts"]
         response_ids = data.batch["responses"]
         attention_mask = data.batch["attention_mask"]
@@ -63,17 +63,19 @@ class BatchRewardManager(AbstractRewardManager):
         data_sources = data.non_tensor_batch[self.reward_fn_key]
         extras = data.non_tensor_batch.get("extra_info", [None] * len(data))
 
+        # Pass return_separated parameter to compute_score
         scores = self.compute_score(
             data_sources=data_sources,
             solution_strs=responses_str,
             ground_truths=ground_truths,
             extra_infos=extras,
+            return_separated=return_separated,
             **self.reward_kwargs,
         )
 
         return scores
 
-    def __call__(self, data: DataProto, return_dict: bool = False) -> torch.Tensor | dict[str, Any]:
+    def __call__(self, data: DataProto, return_dict: bool = False, return_separated: bool = False) -> torch.Tensor | dict[str, Any]:
         # If there is rm score, we directly return rm score. Otherwise, we compute via rm_score_fn
         if "rm_scores" in data.batch.keys():
             if return_dict:
@@ -91,13 +93,26 @@ class BatchRewardManager(AbstractRewardManager):
         valid_response_lengths = attention_mask[:, prompt_len:].sum(dim=-1)
         data_sources = data.non_tensor_batch[self.reward_fn_key]
 
-        scores = self.verify(data)
+        scores = self.verify(data, return_separated=return_separated)
         rewards = []
         already_printed: dict[str, Any] = {}
+        
+        # Handle separated rewards if requested
+        separated_rewards = None
+        if return_separated and isinstance(scores, dict) and ("R_tr" in scores or "R_th" in scores):
+            separated_rewards = {
+                "R_tr": scores.get("R_tr", [0.0] * len(data)),
+                "R_th": scores.get("R_th", [0.0] * len(data)),
+                "R_combined": scores.get("R_combined", [0.0] * len(data))
+            }
+            # Use combined scores for main processing
+            scores_to_process = scores.get("R_combined", [0.0] * len(data))
+        else:
+            scores_to_process = scores
 
         for i in range(len(data)):
             length = valid_response_lengths[i].item()
-            score = scores[i]
+            score = scores_to_process[i] if hasattr(scores_to_process, '__getitem__') else scores_to_process
 
             if isinstance(score, dict):
                 reward = score["score"]
@@ -117,12 +132,16 @@ class BatchRewardManager(AbstractRewardManager):
                 print("[prompt]", prompt_str)
                 print("[response]", response_str)
                 print("[ground_truth]", ground_truth)
-                print("[score]", scores[i])
+                print("[score]", scores_to_process[i] if hasattr(scores_to_process, '__getitem__') else scores_to_process)
                 already_printed[data_source] = already_printed.get(data_source, 0) + 1
 
         data.batch["acc"] = torch.tensor(rewards, dtype=torch.float32, device=prompt_ids.device)
 
         if return_dict:
-            return {"reward_tensor": reward_tensor, "reward_extra_info": reward_extra_info}
+            result = {"reward_tensor": reward_tensor, "reward_extra_info": reward_extra_info}
+            # Add separated rewards to the result
+            if separated_rewards is not None:
+                result["reward_separated"] = separated_rewards
+            return result
         else:
             return reward_tensor

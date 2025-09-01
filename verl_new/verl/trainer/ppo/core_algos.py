@@ -256,6 +256,106 @@ def compute_gae_advantage_return(
     return advantages, returns
 
 
+def create_separated_masks(responses, tokenizer, response_mask):
+    """
+    Create separated masks for think and translate sections based on token-level detection.
+    
+    Args:
+        responses: Tensor of shape (batch_size, seq_len) containing tokenized responses
+        tokenizer: Tokenizer used to tokenize the responses
+        response_mask: Original response mask of shape (batch_size, seq_len)
+        
+    Returns:
+        mask_tr: Mask covering only translate tokens (batch_size, seq_len)
+        mask_th: Mask covering only think tokens (batch_size, seq_len)
+    """
+    batch_size, seq_len = responses.shape
+    mask_tr = torch.zeros_like(response_mask, dtype=torch.bool)
+    mask_th = torch.zeros_like(response_mask, dtype=torch.bool)
+    
+    # Get special token IDs (keep as lists to handle multi-token cases)
+    think_start_ids = tokenizer.encode("<think>", add_special_tokens=False)
+    think_end_ids = tokenizer.encode("</think>", add_special_tokens=False)
+    translate_start_ids = tokenizer.encode("<translate>", add_special_tokens=False)
+    translate_end_ids = tokenizer.encode("</translate>", add_special_tokens=False)
+    
+    print(f"Token IDs - think_start: {think_start_ids}, think_end: {think_end_ids}")
+    print(f"Token IDs - translate_start: {translate_start_ids}, translate_end: {translate_end_ids}")
+    
+    def find_token_sequence(tokens, target_ids):
+        """Find all positions where target_ids sequence appears in tokens."""
+        positions = []
+        for i in range(len(tokens) - len(target_ids) + 1):
+            if all(tokens[i + j].item() == target_ids[j] for j in range(len(target_ids))):
+                positions.append((i, i + len(target_ids)))  # (start_idx, end_idx)
+        return positions
+    
+    for i in range(batch_size):
+        # Skip if no valid response tokens
+        if response_mask[i].sum() == 0:
+            continue
+            
+        # Get response tokens
+        response_tokens = responses[i][response_mask[i].bool()]
+        response_indices = torch.where(response_mask[i])[0]
+        
+        # Find all occurrences of each tag sequence
+        think_start_matches = find_token_sequence(response_tokens, think_start_ids)
+        think_end_matches = find_token_sequence(response_tokens, think_end_ids)
+        translate_start_matches = find_token_sequence(response_tokens, translate_start_ids)
+        translate_end_matches = find_token_sequence(response_tokens, translate_end_ids)
+        
+        # Create think mask (exclude the tags, only include content)
+        if think_start_matches and think_end_matches:
+            # Use the first think section found
+            think_start_local, think_start_end_local = think_start_matches[0]  # <think> tag span
+            think_end_start_local, think_end_end_local = think_end_matches[0]   # </think> tag span
+            
+            # Content starts after <think> tag ends, content ends before </think> tag starts
+            content_start_local = think_start_end_local  # After <think>
+            content_end_local = think_end_start_local    # Before </think>
+            
+            # Only create mask if there's actual content between tags
+            if content_start_local < content_end_local and content_end_local <= len(response_indices):
+                # Convert local indices to global indices (content only, excluding tags)
+                think_content_start_global = response_indices[content_start_local].item()
+                think_content_end_global = response_indices[content_end_local - 1].item() + 1
+                
+                # Set mask only for content between tags (excluding the tags themselves)
+                mask_th[i, think_content_start_global:think_content_end_global] = True
+                print(f"Sample {i}: Think CONTENT at tokens {think_content_start_global}-{think_content_end_global} (excluding tags)")
+            else:
+                print(f"Sample {i}: Think section found but no content between tags")
+        
+        # Create translate mask (exclude the tags, only include content)
+        if translate_start_matches and translate_end_matches:
+            # Use the first translate section found
+            translate_start_local, translate_start_end_local = translate_start_matches[0]  # <translate> tag span
+            translate_end_start_local, translate_end_end_local = translate_end_matches[0]   # </translate> tag span
+            
+            # Content starts after <translate> tag ends, content ends before </translate> tag starts
+            content_start_local = translate_start_end_local  # After <translate>
+            content_end_local = translate_end_start_local    # Before </translate>
+            
+            # Only create mask if there's actual content between tags
+            if content_start_local < content_end_local and content_end_local <= len(response_indices):
+                # Convert local indices to global indices (content only, excluding tags)
+                translate_content_start_global = response_indices[content_start_local].item()
+                translate_content_end_global = response_indices[content_end_local - 1].item() + 1
+                
+                # Set mask only for content between tags (excluding the tags themselves)
+                mask_tr[i, translate_content_start_global:translate_content_end_global] = True
+                print(f"Sample {i}: Translate CONTENT at tokens {translate_content_start_global}-{translate_content_end_global} (excluding tags)")
+            else:
+                print(f"Sample {i}: Translate section found but no content between tags")
+    
+    # Ensure masks only cover valid response tokens
+    mask_tr = mask_tr & response_mask.bool()
+    mask_th = mask_th & response_mask.bool()
+    
+    return mask_tr.float(), mask_th.float()
+
+
 # NOTE(sgm): this implementation only consider outcome supervision, where the reward is a scalar.
 @register_adv_est(AdvantageEstimator.GRPO)  # or simply: @register_adv_est("grpo")
 def compute_grpo_outcome_advantage(
@@ -322,6 +422,99 @@ def compute_grpo_outcome_advantage(
         scores = scores.unsqueeze(-1) * response_mask
 
     return scores, scores
+
+
+def compute_grpo_separated_advantages(
+    token_level_rewards_tr: torch.Tensor,
+    token_level_rewards_th: torch.Tensor, 
+    response_mask_tr: torch.Tensor,
+    response_mask_th: torch.Tensor,
+    index: np.ndarray,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute separated advantages for translate and think sections using GRPO.
+    
+    Args:
+        token_level_rewards_tr: Translate rewards (bs, response_length) 
+        token_level_rewards_th: Think rewards (bs, response_length)
+        response_mask_tr: Mask for translate section (bs, response_length)
+        response_mask_th: Mask for think section (bs, response_length)
+        index: Group indices for responses (bs,)
+        epsilon: Small value for numerical stability
+        norm_adv_by_std_in_grpo: Whether to normalize advantages by std
+        
+    Returns:
+        A_tr_broadcast: Advantages for translate section (bs, response_length)
+        A_th_broadcast: Advantages for think section (bs, response_length)
+    """
+    
+    def compute_advantages_for_section(rewards, mask, index, epsilon, norm_adv_by_std):
+        """Helper function to compute advantages for one section"""
+        with torch.no_grad():
+            # Ensure rewards and mask are on the same device
+            rewards = rewards.to(mask.device)
+            
+            # Compute per-sample rewards by averaging over valid tokens (avoid length bias)
+            valid_token_counts = mask.sum(dim=1).clamp_min(1.0)  # Avoid division by zero
+            total_rewards = (rewards * mask).sum(dim=1)  # Total rewards per sample
+            per_sample_rewards = total_rewards / valid_token_counts  # (bs,) average rewards
+            
+            # Debug: show length normalization effect
+            if torch.any(valid_token_counts > 1):
+                print(f"Section lengths: min={valid_token_counts.min().item():.0f}, "
+                      f"max={valid_token_counts.max().item():.0f}, "
+                      f"mean={valid_token_counts.float().mean().item():.1f}")
+                print(f"Before normalization - reward range: {total_rewards.min().item():.3f} to {total_rewards.max().item():.3f}")
+                print(f"After normalization - reward range: {per_sample_rewards.min().item():.3f} to {per_sample_rewards.max().item():.3f}")
+            
+            # Group-wise advantage calculation
+            id2mean = {}
+            id2std = {}
+            id2count = {}
+            
+            # Compute group statistics
+            for i in range(len(index)):
+                group_id = index[i]
+                if group_id not in id2mean:
+                    # Find all samples in this group
+                    group_mask = (index == group_id)
+                    group_rewards = per_sample_rewards[group_mask]
+                    
+                    id2mean[group_id] = group_rewards.mean().item()
+                    id2std[group_id] = group_rewards.std().item() if len(group_rewards) > 1 else 1.0
+                    id2count[group_id] = len(group_rewards)
+            
+            # Compute advantages (z-score normalization within groups)
+            advantages = torch.zeros_like(per_sample_rewards)
+            
+            for i in range(len(index)):
+                group_id = index[i]
+                if norm_adv_by_std and id2count[group_id] > 1:
+                    # Normalize by group std if enabled and group has >1 samples
+                    std = max(id2std[group_id], epsilon)
+                    advantages[i] = (per_sample_rewards[i] - id2mean[group_id]) / std
+                else:
+                    # Just subtract group mean
+                    advantages[i] = per_sample_rewards[i] - id2mean[group_id]
+            
+            # Broadcast advantages to token level
+            advantages_broadcast = advantages.unsqueeze(-1) * mask  # (bs, response_length)
+            
+            return advantages_broadcast
+    
+    # Compute advantages for translate section
+    A_tr_broadcast = compute_advantages_for_section(
+        token_level_rewards_tr, response_mask_tr, index, epsilon, norm_adv_by_std_in_grpo
+    )
+    
+    # Compute advantages for think section  
+    A_th_broadcast = compute_advantages_for_section(
+        token_level_rewards_th, response_mask_th, index, epsilon, norm_adv_by_std_in_grpo
+    )
+    
+    return A_tr_broadcast, A_th_broadcast
 
 
 @register_adv_est(AdvantageEstimator.GRPO_PASSK)  # or simply: @register_adv_est("grpo_passk")

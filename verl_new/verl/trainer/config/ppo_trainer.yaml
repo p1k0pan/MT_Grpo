@@ -125,6 +125,7 @@ algorithm:
   # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
   _target_: verl.trainer.config.AlgoConfig
 
+  use_separated_loss: False
   # Discount factor for future rewards
   gamma: 1.0
 

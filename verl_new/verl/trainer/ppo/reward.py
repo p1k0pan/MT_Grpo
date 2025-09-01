@@ -169,6 +169,112 @@ def compute_reward(data: DataProto, reward_fn: AbstractRewardManager) -> tuple[t
     return reward_tensor, reward_extra_infos_dict
 
 
+def compute_reward_with_separation(data: DataProto, reward_fn: AbstractRewardManager) -> tuple[torch.Tensor, dict[str, Any]]:
+    """
+    Compute separated rewards for translate and think sections.
+    
+    Args:
+        data: DataProto object containing the input data.
+        reward_fn: Reward function to compute the reward.
+        
+    Returns:
+        Tuple of reward tensor and extra info dictionary with separated rewards.
+    """
+    try:
+        # Try to call reward function with separation enabled
+        try:
+            # Call with return_separated=True
+            reward_result = reward_fn(data, return_dict=True, return_separated=True)
+        except TypeError:
+            # If reward_fn doesn't support return_separated, fallback to standard computation
+            print("Warning: reward_fn doesn't support return_separated parameter, falling back to standard computation")
+            reward_result = reward_fn(data, return_dict=True)
+            
+        if isinstance(reward_result, dict) and "reward_separated" in reward_result:
+            # Separated rewards are available
+            separated_rewards = reward_result["reward_separated"]
+            
+            # Create token-level rewards for each section
+            batch_size, seq_len = data.batch["input_ids"].shape
+            device = data.batch["input_ids"].device
+            
+            # Initialize separated reward tensors
+            R_tr_tensor = torch.zeros(batch_size, seq_len, device=device)
+            R_th_tensor = torch.zeros(batch_size, seq_len, device=device)
+            
+            # Fill rewards (assuming they are outcome rewards - same value for all tokens in response)
+            response_mask = data.batch.get("response_mask", torch.ones(batch_size, seq_len, device=device))
+            
+            for i in range(batch_size):
+                if isinstance(separated_rewards["R_tr"], list):
+                    R_tr_value = separated_rewards["R_tr"][i] if i < len(separated_rewards["R_tr"]) else 0.0
+                    R_th_value = separated_rewards["R_th"][i] if i < len(separated_rewards["R_th"]) else 0.0
+                else:
+                    R_tr_value = separated_rewards["R_tr"]
+                    R_th_value = separated_rewards["R_th"]
+                
+                # Set reward for all response tokens (GRPO style)
+                R_tr_tensor[i] = R_tr_value * response_mask[i]
+                R_th_tensor[i] = R_th_value * response_mask[i]
+            
+            # Create combined reward for backward compatibility
+            combined_reward = R_tr_tensor + R_th_tensor
+            
+            # Create separated masks if possible
+            response_mask_tr = None
+            response_mask_th = None
+            
+            try:
+                # Try to create separated masks using tokenizer from reward_fn
+                if hasattr(reward_fn, 'tokenizer') and reward_fn.tokenizer is not None:
+                    from verl.trainer.ppo.core_algos import create_separated_masks
+                    responses = data.batch.get("responses", data.batch.get("input_ids"))
+                    response_mask_tr, response_mask_th = create_separated_masks(
+                        responses, reward_fn.tokenizer, response_mask
+                    )
+                    print(f"Created separated masks - TR: {response_mask_tr.sum().item()} tokens, TH: {response_mask_th.sum().item()} tokens")
+            except Exception as e:
+                print(f"Warning: Could not create separated masks: {e}")
+            
+            # Create reward tensor with separated info
+            batch_data = {
+                "token_level_rewards": combined_reward,
+                "token_level_scores": combined_reward,  # alias
+                "token_level_rewards_separated": {
+                    "R_tr": R_tr_tensor,
+                    "R_th": R_th_tensor,
+                    "R_combined": combined_reward
+                }
+            }
+            
+            # Add separated masks if available
+            if response_mask_tr is not None and response_mask_th is not None:
+                batch_data["response_mask_tr"] = response_mask_tr
+                batch_data["response_mask_th"] = response_mask_th
+            
+            reward_tensor = DataProto(batch=batch_data)
+            
+            reward_extra_infos_dict = reward_result.get("reward_extra_info", {})
+            reward_extra_infos_dict.update({
+                "separated_rewards_available": True,
+                "avg_R_tr": float(torch.mean(R_tr_tensor[response_mask.bool()]).item()) if response_mask.sum() > 0 else 0.0,
+                "avg_R_th": float(torch.mean(R_th_tensor[response_mask.bool()]).item()) if response_mask.sum() > 0 else 0.0,
+            })
+            
+        else:
+            # No separated rewards available, fall back to standard computation
+            print("Warning: Separated rewards not available from reward function, falling back to standard computation")
+            reward_tensor = reward_result["reward_tensor"]
+            reward_extra_infos_dict = reward_result.get("reward_extra_info", {})
+            
+    except Exception as e:
+        print(f"Error in compute_reward_with_separation: {e}")
+        # Fall back to standard reward computation
+        reward_tensor, reward_extra_infos_dict = compute_reward(data, reward_fn)
+        
+    return reward_tensor, reward_extra_infos_dict
+
+
 @ray.remote(num_cpus=1)
 def compute_reward_async(data: DataProto, config=None, tokenizer=None, reward_fn=None):
     """

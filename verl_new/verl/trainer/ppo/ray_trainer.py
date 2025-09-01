@@ -49,7 +49,7 @@ from verl.trainer.ppo.metric_utils import (
     compute_timing_metrics,
     process_validation_metrics,
 )
-from verl.trainer.ppo.reward import compute_reward, compute_reward_async
+from verl.trainer.ppo.reward import compute_reward, compute_reward_async, compute_reward_with_separation
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
@@ -242,17 +242,66 @@ def compute_advantage(
                 config.pf_ppo.get("weight_pow"),
             )
     elif adv_estimator == AdvantageEstimator.GRPO:
-        # Initialize the mask for GRPO calculation
-        grpo_calculation_mask = data.batch["response_mask"]
-        # Call compute_grpo_outcome_advantage with parameters matching its definition
-        advantages, returns = core_algos.compute_grpo_outcome_advantage(
-            token_level_rewards=data.batch["token_level_rewards"],
-            response_mask=grpo_calculation_mask,
-            index=data.non_tensor_batch["uid"],
-            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-        )
-        data.batch["advantages"] = advantages
-        data.batch["returns"] = returns
+        # Check if separated loss mode is enabled
+        use_separated_loss = getattr(config, 'use_separated_loss', False) if config else False
+        
+        if use_separated_loss and "token_level_rewards_separated" in data.batch:
+            # Separated GRPO mode: compute advantages for translate and think separately
+            from verl.trainer.ppo.core_algos import compute_grpo_separated_advantages, create_separated_masks
+            
+            # Get separated rewards
+            separated_rewards = data.batch["token_level_rewards_separated"]
+            R_tr = separated_rewards["R_tr"]  # (batch_size, seq_len)
+            R_th = separated_rewards["R_th"]  # (batch_size, seq_len)
+            
+            # Create separated masks based on response text
+            if "response_mask_tr" in data.batch and "response_mask_th" in data.batch:
+                # Use pre-computed masks if available
+                mask_tr = data.batch["response_mask_tr"]
+                mask_th = data.batch["response_mask_th"]
+            else:
+                # Masks should have been created during reward computation
+                # If not available, use full response mask as fallback
+                mask_tr = data.batch["response_mask"]
+                mask_th = data.batch["response_mask"]
+                print("Warning: Separated masks not pre-computed. Using full response mask for both sections.")
+                print("Separated masks should be created during reward computation phase for proper functionality.")
+            
+            # Compute separated advantages
+            A_tr_broadcast, A_th_broadcast = compute_grpo_separated_advantages(
+                token_level_rewards_tr=R_tr,
+                token_level_rewards_th=R_th,
+                response_mask_tr=mask_tr,
+                response_mask_th=mask_th,
+                index=data.non_tensor_batch["uid"],
+                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            )
+            
+            # Store separated advantages and masks for actor
+            data.batch["advantages_tr"] = A_tr_broadcast
+            data.batch["advantages_th"] = A_th_broadcast
+            data.batch["response_mask_tr"] = mask_tr
+            data.batch["response_mask_th"] = mask_th
+            
+            # Also compute combined advantages for backward compatibility
+            combined_advantages = A_tr_broadcast + A_th_broadcast
+            combined_returns = combined_advantages  # In GRPO, returns = advantages
+            data.batch["advantages"] = combined_advantages
+            data.batch["returns"] = combined_returns
+            
+        else:
+            # Standard unified GRPO mode
+            # Initialize the mask for GRPO calculation
+            grpo_calculation_mask = data.batch["response_mask"]
+            # Call compute_grpo_outcome_advantage with parameters matching its definition
+            advantages, returns = core_algos.compute_grpo_outcome_advantage(
+                token_level_rewards=data.batch["token_level_rewards"],
+                response_mask=grpo_calculation_mask,
+                index=data.non_tensor_batch["uid"],
+                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            )
+            data.batch["advantages"] = advantages
+            data.batch["returns"] = returns
     else:
         # handle all other adv estimator type other than GAE and GRPO
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
@@ -1027,10 +1076,19 @@ class RayPPOTrainer:
                             reward_tensor = self.rm_wg.compute_rm_score(batch)
                             batch = batch.union(reward_tensor)
 
+                        # Check if separated loss mode is enabled
+                        use_separated_loss = getattr(self.config.algorithm, 'use_separated_loss', False) if hasattr(self.config, 'algorithm') else False
+
                         if self.config.reward_model.launch_reward_fn_async:
                             future_reward = compute_reward_async.remote(data=batch, reward_fn=self.reward_fn)
                         else:
-                            reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+                            if use_separated_loss:
+                                print("🔥 [SEPARATED_LOSS] Using separated loss mode")
+                                # Get separated rewards from reward function
+                                reward_tensor, reward_extra_infos_dict = compute_reward_with_separation(batch, self.reward_fn)
+                            else:
+                                # Standard unified reward computation
+                                reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
 
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):

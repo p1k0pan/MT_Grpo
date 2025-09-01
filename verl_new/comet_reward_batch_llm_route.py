@@ -344,7 +344,6 @@ def compute_score(*args, **kwargs):
         micro_batch_size = kwargs.get('micro_batch_size', 8)
         return_separated = kwargs.get('return_separated', False)
         
-        print(f"Using BATCH processing for {len(solution_strs)} items")
         return compute_score_batch(data_sources, solution_strs, ground_truths, extra_infos, micro_batch_size, return_separated)
     
     # Check if this is positional arguments (single processing)
@@ -375,7 +374,7 @@ def compute_score(*args, **kwargs):
     else:
         raise ValueError(f"Invalid arguments for compute_score: args={args}, kwargs={kwargs}")
 
-def compute_score_batch(data_sources, solution_strs, ground_truths, extra_infos=None, micro_batch_size=8, return_separated=False):
+def compute_score_batch(data_sources, solution_strs, ground_truths, extra_infos=None, micro_batch_size=8,return_separated=False):
     """
     Batch version of compute_score function.
     Migrated and optimized from MT-R1-Zero DataParallelCOMET.compute_comet_rm
@@ -427,15 +426,6 @@ def compute_score_batch(data_sources, solution_strs, ground_truths, extra_infos=
             R_combined_scores.append(0.0)
             continue
         
-        answer_text = extract_solution(solution_str)
-        if answer_text is None:
-            invalid_items.append(i)
-            # final_scores.append(-3.0)
-            final_scores.append(0)
-            R_tr_scores.append(0.0)
-            R_th_scores.append(0.0) 
-            R_combined_scores.append(0.0)
-            continue
         answer_text, think_text = extract_solution(solution_str)
         if answer_text is  None and think_text is None:
             invalid_items.append(i)
@@ -538,4 +528,4 @@ def compute_score_batch(data_sources, solution_strs, ground_truths, extra_infos=
             "R_combined": R_combined_scores
         }
     else:
-        return final_scores
+        return R_combined_scores
